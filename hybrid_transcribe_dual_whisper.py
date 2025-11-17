@@ -234,12 +234,18 @@ def fast_worker(model, device: str) -> None:
                 )
                 text = result.get("text", "").strip()
                 if text:
-                    # Only update if this segment has not yet been refined.
-                    with transcripts_lock:
-                        entry = transcripts.get(seg_id)
-                        if entry is None or not entry.get("refined", False):
-                            transcripts[seg_id] = {"text": text, "refined": False}
-                    render_transcript()
+                    # Remove mid-sentence punctuation to avoid premature periods
+                    # Keep only apostrophes and basic characters
+                    cleaned = text.replace(".", "").replace(",", "").replace("?", "").replace("!", "")
+                    cleaned = cleaned.strip()
+
+                    if cleaned:
+                        # Only update if this segment has not yet been refined.
+                        with transcripts_lock:
+                            entry = transcripts.get(seg_id)
+                            if entry is None or not entry.get("refined", False):
+                                transcripts[seg_id] = {"text": cleaned, "refined": False}
+                        render_transcript()
             except Exception as e:  # noqa: BLE001
                 print(f"\n[FAST worker error]: {e}", file=sys.stderr)
 
