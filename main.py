@@ -18,7 +18,7 @@ RATE = 16000
 CHUNK = 1024  # frames per buffer
 
 # How many seconds of audio per transcription segment
-SEGMENT_SECONDS = 5
+SEGMENT_SECONDS = 3  # seconds of audio per transcription segment (lower = more live, higher = more accurate)
 SEGMENT_FRAMES = int(RATE / CHUNK * SEGMENT_SECONDS)
 
 
@@ -60,10 +60,13 @@ def transcribe_worker(model) -> None:
                     / 32768.0
                 )
 
-                # Transcribe with Whisper
+                # Transcribe with Whisper (tuned for speed / low latency)
                 result = model.transcribe(
                     audio_np,
                     language="en",
+                    task="transcribe",
+                    temperature=0.0,  # greedy decoding is faster
+                    condition_on_previous_text=False,  # treat each chunk independently
                     fp16=torch.cuda.is_available(),
                 )
                 text = result.get("text", "").strip()
@@ -76,8 +79,8 @@ def transcribe_worker(model) -> None:
 def main() -> None:
     # Load Whisper model
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"Loading Whisper model ('tiny') on {device}...")
-    model = whisper.load_model("tiny", device=device)
+    print(f"Loading Whisper model 'small' on {device} (optimized for speed)...")
+    model = whisper.load_model("small", device=device)
 
     # Initialize PyAudio and start input stream with callback
     p = pyaudio.PyAudio()
