@@ -27,7 +27,16 @@ Run (example):
         --fast-model tiny.en \
         --slow-model small.en \
         --fast-segment-seconds 1.5 \
-        --slow-segment-seconds 6.0
+        --slow-segment-seconds 6.0 
+
+On Windows, use caret (^) for line continuation:
+    python hybrid_transcribe_dual_whisper.py ^
+        --fast-model tiny.en ^
+        --slow-model small.en ^
+        --fast-segment-seconds 1.5 ^
+        --slow-segment-seconds 6.0 ^
+        --device-index 1
+
 """
 
 import argparse
@@ -382,6 +391,16 @@ def main() -> None:
         default=None,
         help="PyAudio input device index (default: system default)",
     )
+    parser.add_argument(
+        "--list-devices", 
+        action="store_true", 
+        help="Print available PyAudio devices and exit."
+    )
+    parser.add_argument(
+        "--device-index", 
+        type=int, 
+        help="PyAudio device index to capture from (use --list-devices to inspect)."
+    )
 
     args = parser.parse_args()
 
@@ -424,14 +443,18 @@ def main() -> None:
     # Initialize PyAudio
     try:
         pa = pyaudio.PyAudio()
-        stream_kwargs = dict(
-            format=FORMAT,
-            channels=CHANNELS,
-            rate=RATE,
-            input=True,
-            frames_per_buffer=CHUNK,
-            stream_callback=audio_callback,
-        )
+        
+        pyaudio_kwargs = {
+            "format": FORMAT,
+            "channels": CHANNELS,
+            "rate": RATE,
+            "input": True,
+            "frames_per_buffer": CHUNK,
+            "stream_callback": audio_callback,
+        }
+        if args.device_index is not None:
+            pyaudio_kwargs["input_device_index"] = args.device_index
+        stream_kwargs = dict(**pyaudio_kwargs)
         if args.input_device is not None:
             stream_kwargs["input_device_index"] = args.input_device
         stream = pa.open(**stream_kwargs)
