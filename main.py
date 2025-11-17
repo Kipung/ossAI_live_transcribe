@@ -5,6 +5,7 @@ import queue
 import threading
 import sys
 import time
+import argparse
 
 import numpy as np
 import pyaudio
@@ -77,6 +78,22 @@ def transcribe_worker(model) -> None:
 
 
 def main() -> None:
+    #parse command-line arguments
+    parser = argparse.ArgumentParser(description="Live transcription of system audio using Whisper.")
+    parser.add_argument("--list-devices", action="store_true", help="Print available PyAudio devices and exit.")
+    parser.add_argument("--device-index", type=int, help="PyAudio device index to capture from (use --list-devices to inspect).")
+    args = parser.parse_args()
+
+    if args.list_devices:
+        p = pyaudio.PyAudio()
+        print("Available PyAudio devices:")
+        for i in range(p.get_device_count()):
+            info = p.get_device_info_by_index(i)
+            print(f"  Index {i}: {info['name']} (Input Channels: {info['maxInputChannels']})")
+        p.terminate()
+        return
+    
+
     # Load Whisper model
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Loading Whisper model 'small' on {device} (optimized for speed)...")
@@ -84,14 +101,17 @@ def main() -> None:
 
     # Initialize PyAudio and start input stream with callback
     p = pyaudio.PyAudio()
-    stream = p.open(
-        format=FORMAT,
-        channels=CHANNELS,
-        rate=RATE,
-        input=True,
-        frames_per_buffer=CHUNK,
-        stream_callback=audio_callback,
-    )
+    pyaudio_kwargs = {
+        "format": FORMAT,
+        "channels": CHANNELS,
+        "rate": RATE,
+        "input": True,
+        "frames_per_buffer": CHUNK,
+        "stream_callback": audio_callback,
+    }
+    if args.device_index is not None:
+        pyaudio_kwargs["input_device_index"] = args.device_index
+    stream = p.open(**pyaudio_kwargs)
     stream.start_stream()
 
     # Background worker thread for transcription
