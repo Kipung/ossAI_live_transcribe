@@ -30,12 +30,18 @@ Dependencies:
     pip install pyaudio numpy torch
     pip install openai-whisper  # NOT 'whisper'
 
+<<<<<<< HEAD
 Run (example):
     python live_transcribe_tk.py \
         --fast-model tiny.en \
         --slow-model small.en \
         --fast-segment-seconds 1.5 \
         --slow-segment-seconds 6.0
+=======
+Run:
+    python live_transcribe_tk.py --model small.en --segment-seconds 1.5 --refine-window 6.0
+    python live_transcribe_tk.py --model small.en --device-index 1 --segment-seconds 1.5 --refine-window 6.0
+>>>>>>> cf5539c0eb485c8d4b7ee2517ed5fea1c4d9af73
 """
 
 import argparse
