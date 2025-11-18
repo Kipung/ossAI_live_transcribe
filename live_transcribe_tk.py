@@ -16,6 +16,7 @@ Dependencies:
 
 Run:
     python live_transcribe_tk.py --model small.en --segment-seconds 1.5 --refine-window 6.0
+    python live_transcribe_tk.py --model small.en --device-index 1 --segment-seconds 1.5 --refine-window 6.0
 """
 
 import argparse
