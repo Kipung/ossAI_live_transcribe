@@ -130,6 +130,8 @@ stream: pyaudio.Stream | None = None
 fast_model = None
 slow_model = None
 device_type = "cpu"
+# Track the currently open input device index for the PyAudio stream
+current_device_index: int | None = None
 
 # ------------------------------
 # Speaker diarization / "who spoke" tracking (slow/refined only)
@@ -539,9 +541,10 @@ def slow_worker() -> None:
 # ------------------------------
 
 def init_audio_and_models(fast_name: str, slow_name: str, device_index: int | None) -> None:
-    """Load Whisper models and open the PyAudio input stream if not already open."""
-    global pa, stream, fast_model, slow_model, device_type, RATE, CHANNELS, CHUNK
+    """Load Whisper models and open the PyAudio input stream if not already open, or if device changed."""
+    global pa, stream, fast_model, slow_model, device_type, RATE, CHANNELS, CHUNK, current_device_index
 
+    # (Re)load models if needed
     if fast_model is None or getattr(fast_model, "_model_name", None) != fast_name:
         print(f"Loading FAST Whisper model '{fast_name}' on {device_type}...")
         fast_model_local = whisper.load_model(fast_name, device=device_type)
@@ -554,8 +557,21 @@ def init_audio_and_models(fast_name: str, slow_name: str, device_index: int | No
         setattr(slow_model_local, "_model_name", slow_name)
         slow_model = slow_model_local
 
-    if pa is None or stream is None:
-        pa_local = pyaudio.PyAudio()
+    # Ensure we have a PyAudio instance
+    if pa is None:
+        pa = pyaudio.PyAudio()
+
+    # If the stream is missing or the device index has changed, (re)open it
+    if stream is None or current_device_index != device_index:
+        # Close any existing stream
+        if stream is not None:
+            try:
+                stream.stop_stream()
+                stream.close()
+            except Exception:
+                pass
+            stream = None
+
         stream_kwargs = dict(
             format=FORMAT,
             channels=CHANNELS,
@@ -566,10 +582,11 @@ def init_audio_and_models(fast_name: str, slow_name: str, device_index: int | No
         )
         if device_index is not None:
             stream_kwargs["input_device_index"] = device_index
-        s = pa_local.open(**stream_kwargs)
+
+        s = pa.open(**stream_kwargs)
         s.start_stream()
-        pa = pa_local
         stream = s
+        current_device_index = device_index
 
 
 # ------------------------------
@@ -577,6 +594,21 @@ def init_audio_and_models(fast_name: str, slow_name: str, device_index: int | No
 # ------------------------------
 
 class TranscribeGUI:
+    def _on_device_change(self, *args) -> None:
+        """Handle changes to the selected input device.
+
+        If transcription is currently running, switch the PyAudio input
+        stream to the newly selected device without requiring a restart.
+        """
+        # Update self.device_index from the current StringVar selection
+        self._update_device_index_from_selection()
+
+        # Only reinitialize audio if we are already running
+        if self.running:
+            fast_name = self.fast_model_var.get().strip() or DEFAULT_FAST_MODEL
+            slow_name = self.slow_model_var.get().strip() or DEFAULT_SLOW_MODEL
+            init_audio_and_models(fast_name, slow_name, self.device_index)
+            self.set_status("Input device switched.")
     def _build_device_list(self) -> List[str]:
         """Return a list of input-capable PyAudio devices as 'index: name' labels."""
         try:
@@ -684,6 +716,8 @@ class TranscribeGUI:
                     default_label = label
                     break
         self.device_var = tk.StringVar(value=default_label)
+        # When the user changes the device selection, update the active input stream.
+        self.device_var.trace_add("write", self._on_device_change)
         self.device_menu = tk.OptionMenu(root, self.device_var, *self.device_choices)
         self.device_menu.config(width=30)
         self.device_menu.grid(row=2, column=1, columnspan=3, padx=4, pady=(0, 4), sticky="w")
