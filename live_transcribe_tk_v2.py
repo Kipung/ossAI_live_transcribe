@@ -60,7 +60,7 @@ DEFAULT_RATE = 16000
 DEFAULT_CHANNELS = 1
 DEFAULT_CHUNK = 1024
 
-DEFAULT_FAST_SEGMENT_SECONDS = 2.0
+DEFAULT_FAST_SEGMENT_SECONDS = 1.5
 DEFAULT_SLOW_SEGMENT_SECONDS = 6.0
 
 DEFAULT_FAST_MODEL = "tiny.en"
@@ -136,7 +136,7 @@ current_device_index: int | None = None
 # ------------------------------
 # Speaker diarization / "who spoke" tracking (slow/refined only)
 # ------------------------------
-ENABLE_DIARIZATION = True  # set False to disable speaker labeling
+ENABLE_DIARIZATION = False  # set False to disable speaker labeling
 
 try:
     from resemblyzer import VoiceEncoder  # pip install resemblyzer
