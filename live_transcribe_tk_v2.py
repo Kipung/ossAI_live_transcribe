@@ -30,7 +30,7 @@ Dependencies:
     pip install openai-whisper  # NOT 'whisper'
 
 Run (example):
-    python live_transcribe_tk.py \
+    python live_transcribe_tk_v2.py \
         --fast-model tiny.en \
         --slow-model small.en \
         --fast-segment-seconds 1.5 \
@@ -51,6 +51,8 @@ import torch
 import whisper
 import tkinter as tk
 from tkinter import scrolledtext
+
+IS_WINDOWS = sys.platform.startswith("win")
 
 # ------------------------------
 # Defaults
@@ -140,6 +142,7 @@ ENABLE_DIARIZATION = False  # set False to disable speaker labeling
 
 try:
     from resemblyzer import VoiceEncoder  # pip install resemblyzer
+
     HAVE_RESEMBLYZER = True
 except ImportError:
     VoiceEncoder = None  # type: ignore
@@ -311,6 +314,7 @@ def is_explosive(text: str, segment_seconds: float, max_wps: float = 4.0) -> boo
     max_words = int(segment_seconds * max_wps)
     return len(words) > max_words
 
+
 def audio_callback(in_data, frame_count, time_info, status):
     """PyAudio callback -> push raw audio chunks into audio_q."""
     if not stop_event.is_set():
@@ -369,9 +373,7 @@ def fast_worker() -> None:
             continue
 
         audio_np = (
-            np.frombuffer(segment_bytes, dtype=np.int16)
-            .astype(np.float32)
-            / 32768.0
+            np.frombuffer(segment_bytes, dtype=np.int16).astype(np.float32) / 32768.0
         )
 
         if np.abs(audio_np).mean() < SILENCE_THRESHOLD:
@@ -382,10 +384,10 @@ def fast_worker() -> None:
                 audio_np,
                 language="en",
                 task="transcribe",
-                temperature=0.0,                    # greedy decoding (no sampling)
-                compression_ratio_threshold=2.0,    # lower => more strict
-                logprob_threshold=-0.5,             # discard very low-confidence outputs
-                no_speech_threshold=0.6,            # treat low-energy as no speech
+                temperature=0.0,  # greedy decoding (no sampling)
+                compression_ratio_threshold=2.0,  # lower => more strict
+                logprob_threshold=-0.5,  # discard very low-confidence outputs
+                no_speech_threshold=0.6,  # treat low-energy as no speech
                 condition_on_previous_text=False,
                 fp16=(device_type == "cuda"),
             )
@@ -395,8 +397,6 @@ def fast_worker() -> None:
 
             # Explosion guard for fast segments
             if is_explosive(text, FAST_SEGMENT_SECONDS):
-                # Optionally print for debugging:
-                # print(f"[fast_worker] dropped explosive segment: {len(text.split())} words", file=sys.stderr)
                 continue
         except Exception as e:
             print(f"[fast_worker error]: {e}", file=sys.stderr)
@@ -473,8 +473,7 @@ def slow_worker() -> None:
             continue
 
         audio_np = (
-            np.frombuffer(combined_bytes, dtype=np.int16)
-            .astype(np.float32)
+            np.frombuffer(combined_bytes, dtype=np.int16).astype(np.float32)
             / 32768.0
         )
 
@@ -501,7 +500,7 @@ def slow_worker() -> None:
 
             if not text:
                 continue
-            #explosion guard for slow window
+            # explosion guard for slow window
             if is_explosive(text, SLOW_SEGMENT_SECONDS):
                 continue
 
@@ -583,10 +582,113 @@ def init_audio_and_models(fast_name: str, slow_name: str, device_index: int | No
         if device_index is not None:
             stream_kwargs["input_device_index"] = device_index
 
+        # On Windows with WASAPI, allow capturing system audio via loopback on output devices.
+        if IS_WINDOWS and device_index is not None:
+            try:
+                wasapi_info = pa.get_host_api_info_by_type(pyaudio.paWASAPI)
+                wasapi_index = wasapi_info.get("index")
+            except Exception:
+                wasapi_index = None
+
+            if wasapi_index is not None:
+                try:
+                    info = pa.get_device_info_by_index(device_index)
+                except Exception:
+                    info = None
+
+                if info is not None and info.get("hostApi") == wasapi_index:
+                    max_out = info.get("maxOutputChannels", 0)
+                    max_in = info.get("maxInputChannels", 0)
+                    # Output-only WASAPI endpoint -> open as loopback
+                    if max_out > 0 and max_in == 0:
+                        stream_kwargs["as_loopback"] = True
+                        if max_out > 0:
+                            stream_kwargs["channels"] = max_out
+
         s = pa.open(**stream_kwargs)
         s.start_stream()
         stream = s
         current_device_index = device_index
+
+
+# ------------------------------
+# PyAudio device helpers
+# ------------------------------
+
+def _get_wasapi_loopback_indices(p: pyaudio.PyAudio) -> set[int]:
+    """Return indices of devices that can be opened with WASAPI loopback on Windows.
+
+    On non-Windows platforms (or when WASAPI is unavailable), this returns an empty set.
+    """
+    if not IS_WINDOWS:
+        return set()
+    try:
+        wasapi_info = p.get_host_api_info_by_type(pyaudio.paWASAPI)
+    except Exception:
+        return set()
+
+    wasapi_index = wasapi_info.get("index")
+    if wasapi_index is None:
+        return set()
+
+    loopback_indices: set[int] = set()
+    try:
+        for i in range(p.get_device_count()):
+            try:
+                info = p.get_device_info_by_index(i)
+            except Exception:
+                continue
+            if (
+                info.get("hostApi") == wasapi_index
+                and info.get("maxOutputChannels", 0) > 0
+            ):
+                loopback_indices.add(i)
+    except Exception:
+        pass
+
+    return loopback_indices
+
+
+def list_pyaudio_devices() -> None:
+    """Print all available PyAudio devices with input/output channel info."""
+    try:
+        p = pyaudio.PyAudio()
+    except Exception as e:
+        print(f"Failed to initialize PyAudio: {e}")
+        return
+
+    print("Available PyAudio devices:")
+    try:
+        try:
+            default_in = p.get_default_input_device_info().get("index")
+        except Exception:
+            default_in = None
+
+        wasapi_loopbacks = _get_wasapi_loopback_indices(p)
+
+        for i in range(p.get_device_count()):
+            try:
+                info = p.get_device_info_by_index(i)
+            except Exception:
+                continue
+            name = info.get("name", f"Device {i}")
+            max_in = info.get("maxInputChannels", 0)
+            max_out = info.get("maxOutputChannels", 0)
+            default_tag = (
+                " [default input]" if default_in is not None and i == default_in else ""
+            )
+            loopback_tag = ""
+            if IS_WINDOWS and i in wasapi_loopbacks:
+                loopback_tag = " [loopback]"
+            print(
+                f"{i}: {name} (inputs: {max_in}, outputs: {max_out})"
+                f"{default_tag}{loopback_tag}"
+            )
+    finally:
+        try:
+            p.terminate()
+        except Exception:
+            pass
 
 
 # ------------------------------
@@ -609,8 +711,12 @@ class TranscribeGUI:
             slow_name = self.slow_model_var.get().strip() or DEFAULT_SLOW_MODEL
             init_audio_and_models(fast_name, slow_name, self.device_index)
             self.set_status("Input device switched.")
+
     def _build_device_list(self) -> List[str]:
-        """Return a list of input-capable PyAudio devices as 'index: name' labels."""
+        """Return a list of input-capable PyAudio devices as 'index: name' labels.
+
+        On Windows, also include WASAPI output devices that can be used in loopback mode.
+        """
         try:
             p = pyaudio.PyAudio()
         except Exception:
@@ -618,11 +724,25 @@ class TranscribeGUI:
 
         labels: List[str] = []
         try:
+            wasapi_loopbacks = _get_wasapi_loopback_indices(p)
+
             for i in range(p.get_device_count()):
-                info = p.get_device_info_by_index(i)
-                if info.get("maxInputChannels", 0) > 0:
-                    dev_name = info.get("name", f"Device {i}")
+                try:
+                    info = p.get_device_info_by_index(i)
+                except Exception:
+                    continue
+                max_in = info.get("maxInputChannels", 0)
+                max_out = info.get("maxOutputChannels", 0)
+                dev_name = info.get("name", f"Device {i}")
+
+                # Always include true input devices
+                if max_in > 0:
                     labels.append(f"{i}: {dev_name}")
+                    continue
+
+                # On Windows, also include WASAPI loopback-capable output devices
+                if IS_WINDOWS and i in wasapi_loopbacks:
+                    labels.append(f"{i}: {dev_name} [loopback]")
         except Exception:
             pass
         finally:
@@ -681,14 +801,18 @@ class TranscribeGUI:
         tk.Label(root, text="Fast model:", anchor="w").grid(
             row=0, column=0, padx=8, pady=(8, 2), sticky="w"
         )
-        self.fast_model_menu = tk.OptionMenu(root, self.fast_model_var, *WHISPER_MODEL_CHOICES)
+        self.fast_model_menu = tk.OptionMenu(
+            root, self.fast_model_var, *WHISPER_MODEL_CHOICES
+        )
         self.fast_model_menu.config(width=18)
         self.fast_model_menu.grid(row=0, column=1, padx=4, pady=(8, 2), sticky="w")
 
         tk.Label(root, text="Slow model:", anchor="w").grid(
             row=0, column=2, padx=8, pady=(8, 2), sticky="w"
         )
-        self.slow_model_menu = tk.OptionMenu(root, self.slow_model_var, *WHISPER_MODEL_CHOICES)
+        self.slow_model_menu = tk.OptionMenu(
+            root, self.slow_model_var, *WHISPER_MODEL_CHOICES
+        )
         self.slow_model_menu.config(width=18)
         self.slow_model_menu.grid(row=0, column=3, padx=4, pady=(8, 2), sticky="w")
 
@@ -720,9 +844,15 @@ class TranscribeGUI:
         self.device_var.trace_add("write", self._on_device_change)
         self.device_menu = tk.OptionMenu(root, self.device_var, *self.device_choices)
         self.device_menu.config(width=30)
-        self.device_menu.grid(row=2, column=1, columnspan=3, padx=4, pady=(0, 4), sticky="w")
+        self.device_menu.grid(
+            row=2, column=1, columnspan=3, padx=4, pady=(0, 4), sticky="w"
+        )
 
         # Header showing current config (updated on start / reload)
+        header = (
+            f"FAST model: {fast_name}  (segment {fast_sec:.1f}s)\n"
+            f"SLOW model: {slow_sec_name if (slow_sec_name := slow_name) else slow_name}"
+        )
         header = (
             f"FAST model: {fast_name}  (segment {fast_sec:.1f}s)\n"
             f"SLOW model: {slow_name}  (window  {slow_sec:.1f}s)\n"
@@ -730,13 +860,17 @@ class TranscribeGUI:
         self.header_label = tk.Label(
             root, text=header, justify="left", anchor="w", font=("Menlo", 10, "bold")
         )
-        self.header_label.grid(row=3, column=0, columnspan=4, padx=8, pady=(4, 4), sticky="w")
+        self.header_label.grid(
+            row=3, column=0, columnspan=4, padx=8, pady=(4, 4), sticky="w"
+        )
 
         # History
         self.history_box = scrolledtext.ScrolledText(
             root, wrap=tk.WORD, height=15, width=80, state="disabled"
         )
-        self.history_box.grid(row=4, column=0, columnspan=4, padx=8, pady=(0, 4), sticky="nsew")
+        self.history_box.grid(
+            row=4, column=0, columnspan=4, padx=8, pady=(0, 4), sticky="nsew"
+        )
 
         # Live line
         self.live_label = tk.Label(
@@ -746,7 +880,9 @@ class TranscribeGUI:
             justify="left",
             font=("Menlo", 12, "italic"),
         )
-        self.live_label.grid(row=5, column=0, columnspan=4, padx=8, pady=(0, 8), sticky="w")
+        self.live_label.grid(
+            row=5, column=0, columnspan=4, padx=8, pady=(0, 8), sticky="w"
+        )
 
         # Buttons
         self.btn_start = tk.Button(root, text="Start", command=self.on_start)
@@ -761,7 +897,9 @@ class TranscribeGUI:
 
         # Status
         self.status_label = tk.Label(root, text="Ready", anchor="w", justify="left")
-        self.status_label.grid(row=7, column=0, columnspan=4, padx=8, pady=(0, 8), sticky="w")
+        self.status_label.grid(
+            row=7, column=0, columnspan=4, padx=8, pady=(0, 8), sticky="w"
+        )
 
         # Grid weight
         root.rowconfigure(4, weight=1)
@@ -985,8 +1123,17 @@ def main() -> None:
         default=None,
         help="PyAudio input device index (optional)",
     )
+    parser.add_argument(
+        "--list-devices",
+        action="store_true",
+        help="Print available PyAudio devices and exit.",
+    )
 
     args = parser.parse_args()
+
+    if args.list_devices:
+        list_pyaudio_devices()
+        return
 
     RATE = args.rate
     CHANNELS = args.channels
@@ -1002,7 +1149,9 @@ def main() -> None:
     device_type = "cuda" if torch.cuda.is_available() else "cpu"
 
     root = tk.Tk()
-    gui = TranscribeGUI(root, args.fast_model, args.slow_model, fast_sec, slow_sec, args.device_index)
+    gui = TranscribeGUI(
+        root, args.fast_model, args.slow_model, fast_sec, slow_sec, args.device_index
+    )
     gui.set_status("Ready. Adjust models/intervals and click Start.")
     root.protocol("WM_DELETE_WINDOW", gui.on_quit)
 
