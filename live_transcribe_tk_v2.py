@@ -131,6 +131,32 @@ fast_model = None
 slow_model = None
 device_type = "cpu"
 
+# ------------------------------
+# Speaker diarization / "who spoke" tracking (slow/refined only)
+# ------------------------------
+ENABLE_DIARIZATION = True  # set False to disable speaker labeling
+
+try:
+    from resemblyzer import VoiceEncoder  # pip install resemblyzer
+    HAVE_RESEMBLYZER = True
+except ImportError:
+    VoiceEncoder = None  # type: ignore
+    HAVE_RESEMBLYZER = False
+
+# Simple incremental clustering over speaker embeddings
+# Higher threshold => harder to merge speakers, more likely to create S2, S3, ...
+# You can tune this between ~0.75 and 0.95 depending on your environment.
+SPEAKER_SIM_THRESHOLD = 0.85
+MAX_SPEAKERS = 8
+
+speaker_encoder: "VoiceEncoder | None" = None
+speaker_centroids: List[np.ndarray] = []
+speaker_counts: List[int] = []
+
+# Track most recent speaker id for the live (FAST) line
+last_speaker_id: int | None = None
+last_speaker_id_lock = threading.Lock()
+
 
 # ------------------------------
 # UI helper
@@ -150,6 +176,76 @@ def post_status(msg: str) -> None:
         ui_q.put_nowait(("status", msg))
     except queue.Full:
         pass
+
+
+# ------------------------------
+# Diarization helpers
+# ------------------------------
+
+def init_speaker_encoder() -> None:
+    """Lazily initialize the speaker embedding encoder."""
+    global speaker_encoder
+    if not ENABLE_DIARIZATION or not HAVE_RESEMBLYZER:
+        return
+    if speaker_encoder is None:
+        speaker_encoder = VoiceEncoder()
+
+
+def assign_speaker_id(audio_np: np.ndarray) -> int | None:
+    """Assign a speaker id for the given audio chunk using simple centroid clustering.
+
+    Returns an integer speaker id (0, 1, 2, ...) or None if diarization is disabled.
+    """
+    global speaker_centroids, speaker_counts
+
+    if not ENABLE_DIARIZATION or not HAVE_RESEMBLYZER:
+        return None
+
+    init_speaker_encoder()
+    if speaker_encoder is None:
+        return None
+
+    # Ensure 1-D float32 array
+    wav = audio_np.astype(np.float32).flatten()
+    if wav.size == 0:
+        return None
+
+    emb = speaker_encoder.embed_utterance(wav)
+
+    # First speaker
+    if not speaker_centroids:
+        speaker_centroids.append(emb)
+        speaker_counts.append(1)
+        return 0
+
+    # Compute cosine similarity to existing centroids
+    sims = []
+    for c in speaker_centroids:
+        denom = (np.linalg.norm(c) * np.linalg.norm(emb)) + 1e-8
+        sims.append(float(np.dot(c, emb) / denom))
+    best_idx = int(np.argmax(sims))
+    best_sim = sims[best_idx]
+
+    if best_sim >= SPEAKER_SIM_THRESHOLD:
+        # Update that centroid
+        count = speaker_counts[best_idx]
+        new_centroid = (speaker_centroids[best_idx] * count + emb) / (count + 1)
+        speaker_centroids[best_idx] = new_centroid
+        speaker_counts[best_idx] = count + 1
+        return best_idx
+
+    # Otherwise, create a new speaker if we have capacity
+    if len(speaker_centroids) < MAX_SPEAKERS:
+        speaker_centroids.append(emb)
+        speaker_counts.append(1)
+        return len(speaker_centroids) - 1
+
+    # If at capacity, just assign to the most similar existing speaker
+    count = speaker_counts[best_idx]
+    new_centroid = (speaker_centroids[best_idx] * count + emb) / (count + 1)
+    speaker_centroids[best_idx] = new_centroid
+    speaker_counts[best_idx] = count + 1
+    return best_idx
 
 
 def compute_snapshot() -> Tuple[List[str], str]:
@@ -172,7 +268,12 @@ def compute_snapshot() -> Tuple[List[str], str]:
             if not text:
                 continue
             if entry.get("refined", False):
-                refined_lines.append(text)
+                speaker_id = entry.get("speaker")
+                if isinstance(speaker_id, int):
+                    label = f"S{speaker_id + 1}: "
+                else:
+                    label = ""
+                refined_lines.append(label + text)
             else:
                 ts = entry.get("ts")
                 if ts is not None:
@@ -185,6 +286,13 @@ def compute_snapshot() -> Tuple[List[str], str]:
             refined_lines = refined_lines[-MAX_HISTORY_LINES:]
 
         live_line = " ".join(live_segments).strip()
+
+        # Optionally prefix live line with most recent speaker label
+        if live_line:
+            with last_speaker_id_lock:
+                sid = last_speaker_id
+            if isinstance(sid, int):
+                live_line = f"S{sid + 1} • {live_line}"
 
     return refined_lines, live_line
 
@@ -368,6 +476,9 @@ def slow_worker() -> None:
             / 32768.0
         )
 
+        # Assign a speaker id for this combined slow window (if diarization enabled)
+        speaker_id = assign_speaker_id(audio_np)
+
         if np.abs(audio_np).mean() < SILENCE_THRESHOLD:
             continue
 
@@ -392,8 +503,6 @@ def slow_worker() -> None:
             if is_explosive(text, SLOW_SEGMENT_SECONDS):
                 continue
 
-
-
         except Exception as e:
             print(f"[slow_worker error]: {e}", file=sys.stderr)
             text = ""
@@ -413,7 +522,13 @@ def slow_worker() -> None:
                 "text": text,
                 "refined": True,
                 "ts": ts_val,
+                "speaker": speaker_id,
             }
+
+        # Update global "most recent speaker" for live-line labeling
+        if speaker_id is not None:
+            with last_speaker_id_lock:
+                last_speaker_id = speaker_id
 
         schedule_ui_render()
         post_status("Listening... slow refinement updated.")
@@ -649,6 +764,8 @@ class TranscribeGUI:
             self.history_box.delete("1.0", tk.END)
             if history:
                 self.history_box.insert(tk.END, "\n".join(history) + "\n")
+                # Auto-scroll to the end of the history whenever new text is rendered
+                self.history_box.see(tk.END)
             self.history_box.config(state="disabled")
             self.live_label.config(text=live)
 
@@ -765,6 +882,13 @@ class TranscribeGUI:
 
         with segment_counter_lock:
             next_segment_id = 1
+
+        # Reset speaker clustering state for a fresh session
+        global speaker_centroids, speaker_counts, last_speaker_id
+        speaker_centroids = []
+        speaker_counts = []
+        with last_speaker_id_lock:
+            last_speaker_id = None
 
         self.btn_start.config(state="normal")
 
