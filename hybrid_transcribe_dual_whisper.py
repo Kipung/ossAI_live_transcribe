@@ -18,9 +18,13 @@ Notes:
   refined segments appear as history lines, while all current fast
   segments are shown as a single concatenated live line.
 
-Dependencies:
-    pip install pyaudio numpy torch
+Dependencies (Python 3.13 or older):
+    pip install numpy torch
     pip install openai-whisper  # NOT 'whisper'
+    pip install pyaudio         # microphone input only; not needed for --from-file
+
+Reproduce without a microphone:
+    python hybrid_transcribe_dual_whisper.py --from-file samples/standup.wav --plain
 
 Run (example):
     python hybrid_transcribe_dual_whisper.py \
@@ -45,12 +49,17 @@ import queue
 import sys
 import threading
 import time
+import wave
 
 import numpy as np
-import pyaudio
 import torch
 import whisper
-from typing import Dict, Any
+from typing import Dict, Any, Optional
+
+try:
+    import pyaudio
+except ImportError:  # only needed for live microphone input
+    pyaudio = None
 
 # ------------------------------
 # Defaults
@@ -79,7 +88,6 @@ except Exception:
 # Runtime globals
 # ------------------------------
 
-FORMAT = pyaudio.paInt16
 RATE = DEFAULT_RATE
 CHANNELS = DEFAULT_CHANNELS
 CHUNK = DEFAULT_CHUNK
@@ -109,7 +117,11 @@ SLOW_TAG = "[REF] "
 # ------------------------------
 # Rendering
 # ------------------------------
-def render_transcript() -> None:
+PLAIN = False
+START_TIME = time.monotonic()
+
+
+def render_transcript(event: str = "fast") -> None:
     """Clear the screen and redraw the current transcript.
 
     - Refined segments (from the slow model) are treated as history lines.
@@ -131,6 +143,10 @@ def render_transcript() -> None:
                 live_segments.append((seg_id, text))
 
     # ANSI clear screen and move cursor to home
+    if PLAIN:
+        _print_plain(refined_lines, live_segments, event)
+        return
+
     sys.stdout.write("\x1b[2J\x1b[H")
 
     # Print history (refined) lines
@@ -152,6 +168,21 @@ def render_transcript() -> None:
     sys.stdout.flush()
 
 
+def _print_plain(refined_lines, live_segments, event: str) -> None:
+    """Append-only output: one timestamped line per FAST or REF update."""
+    elapsed = f"T+{time.monotonic() - START_TIME:5.1f}s"
+    if event == "ref" and refined_lines:
+        seg_id, text = refined_lines[-1]
+        line = f"[#{seg_id} {SLOW_TAG}] {text}"
+    else:
+        live_text = " ".join(t for _, t in sorted(live_segments) if t).strip()
+        if not live_text:
+            return
+        line = f"[#{sorted(live_segments)[-1][0]} {FAST_TAG}] {live_text}"
+    sys.stdout.write(f"{elapsed}  {line}\n")
+    sys.stdout.flush()
+
+
 # ------------------------------
 # Audio callback
 # ------------------------------
@@ -159,6 +190,33 @@ def audio_callback(in_data, frame_count, time_info, status):
     """PyAudio callback: push mic audio into a raw audio queue."""
     audio_q.put(in_data)
     return (None, pyaudio.paContinue)
+
+
+# ------------------------------
+# File source (replaces the microphone for reproducible demos)
+# ------------------------------
+def file_source(path: str) -> None:
+    """Feed a 16 kHz mono 16-bit WAV into audio_q at real-time speed.
+
+    Trailing silence pads the last slow window so it is refined too.
+    """
+    with wave.open(path, "rb") as wf:
+        if (wf.getframerate(), wf.getnchannels(), wf.getsampwidth()) != (RATE, 1, 2):
+            raise SystemExit(
+                f"{path} must be 16 kHz mono 16-bit PCM. Convert with: "
+                f"ffmpeg -i in.wav -ar 16000 -ac 1 -c:a pcm_s16le out.wav"
+            )
+        pcm = wf.readframes(wf.getnframes())
+
+    bytes_per_chunk = CHUNK * 2
+    window_bytes = int(SLOW_SEGMENT_SECONDS * RATE) * 2
+    pcm += b"\x00" * (-len(pcm) % window_bytes)
+    pcm += b"\x00" * (-len(pcm) % bytes_per_chunk)
+
+    for i in range(0, len(pcm), bytes_per_chunk):
+        audio_q.put(pcm[i : i + bytes_per_chunk])
+        time.sleep(CHUNK / RATE)
+    audio_q.put(None)
 
 
 # ------------------------------
@@ -337,7 +395,7 @@ def slow_worker(model, device: str) -> None:
                             if gid != final_seg_id:
                                 transcripts.pop(gid, None)
                         transcripts[final_seg_id] = {"text": text, "refined": True}
-                    render_transcript()
+                    render_transcript("ref")
             except Exception as e:  # noqa: BLE001
                 print(f"\n[SLOW worker error]: {e}", file=sys.stderr)
 
@@ -350,7 +408,7 @@ def slow_worker(model, device: str) -> None:
 # ------------------------------
 def main() -> None:
     global RATE, CHANNELS, CHUNK, FAST_SEGMENT_SECONDS, FAST_SEGMENT_FRAMES, SLOW_SEGMENT_SECONDS
-    global audio_q, fast_q, slow_q
+    global audio_q, fast_q, slow_q, PLAIN, START_TIME
 
     parser = argparse.ArgumentParser(
         description="Dual-Whisper live transcriber (fast + refined)"
@@ -398,6 +456,16 @@ def main() -> None:
         help="PyAudio input device index (default: system default)",
     )
     parser.add_argument(
+        "--from-file",
+        metavar="WAV",
+        help="Stream a 16 kHz mono 16-bit WAV in real time instead of the microphone.",
+    )
+    parser.add_argument(
+        "--plain",
+        action="store_true",
+        help="Append one timestamped line per update instead of redrawing the screen.",
+    )
+    parser.add_argument(
         "--list-devices", 
         action="store_true", 
         help="Print available PyAudio devices and exit."
@@ -409,6 +477,21 @@ def main() -> None:
     )
 
     args = parser.parse_args()
+
+    if args.list_devices:
+        if pyaudio is None:
+            raise SystemExit("pyaudio is not installed.")
+        pa = pyaudio.PyAudio()
+        for i in range(pa.get_device_count()):
+            info = pa.get_device_info_by_index(i)
+            if info["maxInputChannels"] > 0:
+                print(f"{i}: {info['name']}")
+        pa.terminate()
+        return
+
+    if args.from_file is None and pyaudio is None:
+        raise SystemExit("pyaudio is not installed. Install it, or use --from-file WAV.")
+    PLAIN = args.plain
 
     # Apply audio config
     RATE = args.rate
@@ -446,29 +529,25 @@ def main() -> None:
         print(f"Failed to load slow Whisper model '{args.slow_model}': {e}")
         return
 
-    # Initialize PyAudio
-    try:
-        pa = pyaudio.PyAudio()
-        
-        pyaudio_kwargs = {
-            "format": FORMAT,
-            "channels": CHANNELS,
-            "rate": RATE,
-            "input": True,
-            "frames_per_buffer": CHUNK,
-            "stream_callback": audio_callback,
-        }
-        if args.device_index is not None:
-            pyaudio_kwargs["input_device_index"] = args.device_index
-        stream_kwargs = dict(**pyaudio_kwargs)
-        if args.input_device is not None:
-            stream_kwargs["input_device_index"] = args.input_device
-        stream = pa.open(**stream_kwargs)
-    except Exception as e:
-        print(f"Failed to open audio input: {e}")
-        return
-
-    stream.start_stream()
+    pa = stream = None
+    if args.from_file is None:
+        try:
+            pa = pyaudio.PyAudio()
+            stream = pa.open(
+                format=pyaudio.paInt16,
+                channels=CHANNELS,
+                rate=RATE,
+                input=True,
+                frames_per_buffer=CHUNK,
+                stream_callback=audio_callback,
+                input_device_index=(
+                    args.input_device if args.input_device is not None else args.device_index
+                ),
+            )
+        except Exception as e:
+            print(f"Failed to open audio input: {e}")
+            return
+        stream.start_stream()
 
     # Threads
     t_segmenter = threading.Thread(target=segmenter_worker, daemon=True)
@@ -488,11 +567,20 @@ def main() -> None:
         f"- SLOW model: {args.slow_model}, "
         f"window: {SLOW_SEGMENT_SECONDS:.2f}s (groups multiple fast segments)"
     )
-    print("Press Ctrl+C to stop.\n")
+    print("Press Ctrl+C to stop.\n" if stream else f"Streaming {args.from_file} in real time.\n")
 
+    START_TIME = time.monotonic()
     try:
-        while stream.is_active():
-            time.sleep(0.1)
+        if stream:
+            while stream.is_active():
+                time.sleep(0.1)
+        else:
+            file_source(args.from_file)
+            t_segmenter.join()
+            fast_q.put(None)
+            slow_q.put(None)
+            t_fast.join()
+            t_slow.join()
     except KeyboardInterrupt:
         print("\nStopping dual-Whisper transcription...")
     finally:
@@ -502,15 +590,13 @@ def main() -> None:
         slow_q.put(None)
 
         # Stop audio
-        try:
-            stream.stop_stream()
-            stream.close()
-        except Exception:
-            pass
-        try:
+        if stream:
+            try:
+                stream.stop_stream()
+                stream.close()
+            except Exception:
+                pass
             pa.terminate()
-        except Exception:
-            pass
 
         # Join threads
         t_segmenter.join(timeout=1.0)
