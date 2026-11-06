@@ -1,0 +1,6 @@
+# Dual-Whisper headline script. Python 3.13 or older (torch/openai-whisper wheels).
+# Tested: Python 3.12, numpy 1.26.4, torch 2.9.1.
+numpy
+torch
+openai-whisper==20250625   # not the "whisper" package
+pyaudio==0.2.14            # microphone input only; --from-file does not need it
